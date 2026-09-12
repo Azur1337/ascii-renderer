@@ -1,0 +1,21 @@
+# Dependencies
+node_modules
+
+# Build output
+dist
+
+# Local one-off scripts, measurement tools, and reference frames.
+# Kept out of the published repo; safe to delete at any time.
+.scratch
+
+# Project-specific docs (not part of the published package)
+HANDOFF.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+!.env.example
