@@ -1,5 +1,7 @@
 import { GlyphField } from './glyph-field';
 
+export { TARGET_ROWS } from './glyph-field';
+
 // the full printable ASCII set (space through tilde). the default glyph atlas,
 // so any phrase renders; the extras are what the flicker re-rolls to.
 const DEFAULT_ATLAS =
@@ -31,10 +33,10 @@ export interface AsciiRendererOptions {
 	atlas?: string;
 	/**
 	 * the brightness bitmap that lights up a region of the field (0-255 per cell).
-	 * Omit it (or pass `null`) for a plain phrase field with no lit region (a
-	 * backdrop); pass your own bitmap for a different shape.
+	 * Omit it for a plain phrase field with no lit region (a backdrop); pass your
+	 * own bitmap for a different shape.
 	 */
-	bitmap?: number[] | null;
+	bitmap?: number[];
 	/** the width of the bitmap in cells (required with a custom bitmap) */
 	bitmapCols?: number;
 	/** the height of the bitmap in cells (required with a custom bitmap) */
@@ -57,6 +59,19 @@ export interface AsciiRendererOptions {
 	background?: string;
 	/** the width/height ratio of a single glyph cell (monospace aspect) */
 	cellAspect?: number;
+	/**
+	 * a fixed cell height in CSS pixels. When set, the field uses this cell size
+	 * instead of deriving it from the canvas height, so the text stays the same
+	 * size no matter how tall the canvas is. Omit it to derive the cell size
+	 * from the canvas.
+	 */
+	cellHeight?: number;
+	/**
+	 * fraction of cells (0-1) swapped for random atlas glyphs. Breaks up the
+	 * phrase's lockstep repetition so a tiled field reads as texture instead of
+	 * a repeating pattern. 0 (default) keeps the phrase clean.
+	 */
+	scatter?: number;
 	/** how often a flickering cell re-rolls its glyph (ms) */
 	flickerIntervalMs?: number;
 	/** how long a flicker lasts before it settles (ms) */
@@ -109,6 +124,21 @@ export interface AsciiRendererOptions {
 
 export interface AsciiRenderer {
 	resize(width: number, height: number, dpr: number): void;
+	/** set a fixed cell height in CSS px (omit it to revert to the canvas-derived size) */
+	setCellHeight(height?: number): void;
+	/**
+	 * update the lit region's fractions after construction (e.g. when the host
+	 * measures them off a canvas that changes size after boot). omitted values
+	 * keep their current setting.
+	 */
+	setRegion(region: { width?: number; height?: number; x?: number; y?: number }): void;
+	/**
+	 * tell the field how tall the visible viewport is (CSS px). the click
+	 * band's ring is sized against this instead of the canvas height, so a
+	 * canvas taller than the viewport gets a screen-sized ring. 0 (default)
+	 * = the canvas is the viewport.
+	 */
+	setViewportHeight(height: number): void;
 	/** render a frame; pass the animation clock (ms) to drive the flicker */
 	render(time?: number): void;
 	/** swap the phrase that fills the field */
@@ -137,7 +167,7 @@ export function createAsciiRenderer(
 		ink: options.ink,
 		font: options.font,
 		background: options.background,
-		bitmap: options.bitmap ?? null,
+		bitmap: options.bitmap,
 		bitmapCols: options.bitmapCols ?? 0,
 		bitmapRows: options.bitmapRows ?? 0,
 		regionWidthFraction: options.regionWidthFraction,
@@ -145,6 +175,8 @@ export function createAsciiRenderer(
 		regionXFraction: options.regionXFraction,
 		regionYFraction: options.regionYFraction,
 		cellAspect: options.cellAspect,
+		cellHeight: options.cellHeight,
+		scatter: options.scatter,
 		flickerIntervalMs: options.flickerIntervalMs,
 		flickerDurationMs: options.flickerDurationMs,
 		flickerCount: options.flickerCount,
@@ -161,6 +193,15 @@ export function createAsciiRenderer(
 	return {
 		resize(width, height, dpr) {
 			field.resize(width, height, dpr);
+		},
+		setCellHeight(height) {
+			field.setCellHeight(height);
+		},
+		setRegion(region) {
+			field.setRegion(region);
+		},
+		setViewportHeight(height) {
+			field.setViewportHeight(height);
 		},
 		render(time) {
 			field.render(time);

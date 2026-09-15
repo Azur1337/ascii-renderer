@@ -11,7 +11,7 @@ import { bandSpread, colorForRgb, hash01, hexToRgb, noise2, voidErase } from './
 // target ~77 rows of cells so the field reads as dense at a 16:9 viewport.
 // the cell size is derived from the viewport, so the density holds at any
 // resolution.
-const TARGET_ROWS = 77;
+export const TARGET_ROWS = 77;
 
 export interface GlyphFieldOptions {
 	atlas: string;
@@ -31,10 +31,10 @@ export interface GlyphFieldOptions {
 	ink?: string;
 	/**
 	 * the brightness bitmap and its dimensions. The bitmap is sampled down to the
-	 * current grid so the shape keeps its detail at any size. Pass `null` (or omit
-	 * it) for a plain phrase field with no lit region.
+	 * current grid so the shape keeps its detail at any size. Omit it for a plain
+	 * phrase field with no lit region.
 	 */
-	bitmap?: number[] | null;
+	bitmap?: number[];
 	bitmapCols?: number;
 	bitmapRows?: number;
 	/** fraction of the width the lit region occupies (0-1) */
@@ -53,6 +53,19 @@ export interface GlyphFieldOptions {
 	regionYFraction?: number;
 	/** the width/height ratio of a single glyph cell (monospace aspect) */
 	cellAspect?: number;
+	/**
+	 * a fixed cell height in CSS pixels. When set, the field uses this cell size
+	 * instead of deriving it from the canvas height, so the text stays the same
+	 * size no matter how tall the canvas is (a tall section backdrop, for
+	 * example). Omit it to derive the cell size from the canvas.
+	 */
+	cellHeight?: number;
+	/**
+	 * fraction of cells (0-1) swapped for random atlas glyphs. Breaks up the
+	 * phrase's lockstep repetition so a tiled field reads as texture instead of
+	 * a repeating pattern. 0 (default) keeps the phrase clean.
+	 */
+	scatter?: number;
 	/** how often a flickering cell re-rolls its glyph (ms) */
 	flickerIntervalMs?: number;
 	/** how long a flicker lasts before it settles (ms) */
@@ -130,15 +143,15 @@ export class GlyphField {
 	// the faint field color (outside the hand), as rgb
 	private field: [number, number, number];
 
-	// the brightness bitmap that lights up a region (0-255 per cell), or null for
-	// a plain phrase field with no lit region
-	private bitmap: number[] | null;
+	// the brightness bitmap that lights up a region (0-255 per cell), or undefined
+	// for a plain phrase field with no lit region
+	private bitmap?: number[];
 	private bitmapCols = 0;
 	private bitmapRows = 0;
 	private regionWidthFraction: number;
 	private regionHeightFraction: number;
-	private regionXFraction: number | null;
-	private regionYFraction: number | null;
+	private regionXFraction?: number;
+	private regionYFraction?: number;
 
 	// the current grid (recomputed on resize so it scales with the canvas)
 	private cols = 0;
@@ -147,8 +160,8 @@ export class GlyphField {
 	// the base character per cell (atlas index), or -1 for a space
 	private base: Int16Array = new Int16Array(0);
 
-	// the hand brightness per cell (0-255), or null for a plain backdrop
-	private brightness: number[] | null;
+	// the hand brightness per cell (0-255), or undefined for a plain backdrop
+	private brightness?: number[];
 
 	// per-cell flicker state: start time, or -1 when not flickering
 	private flickerStart: Float64Array = new Float64Array(0);
@@ -192,11 +205,21 @@ export class GlyphField {
 	private bg: [number, number, number];
 	private viewW = 0;
 	private viewH = 0;
+	// the visible viewport height in CSS px (0 = the canvas is the viewport);
+	// hosts with a canvas taller than the screen report it so the click band can
+	// size its ring against the viewport instead of the whole canvas
+	private viewportH = 0;
 
 	private cellW = 0;
 	private cellH = 0;
 	private fontSize = 0;
 	private cellAspect: number;
+	// a fixed cell height in CSS px, or null to derive it from the canvas
+	private cellHeight?: number;
+	// fraction of cells swapped for random glyphs (breaks up the phrase pattern)
+	private scatter: number;
+	// the last device pixel ratio, so setCellHeight can re-derive the grid
+	private dpr = 1;
 
 	// where the lit region sits on the grid (in cells), recomputed on resize
 	private regionCol0 = 0;
@@ -228,15 +251,17 @@ export class GlyphField {
 		this.ink = hexToRgb(inkHex);
 		this.field = hexToRgb(this.dark ? '#1f1f1f' : '#e5e2d8');
 		this.cellAspect = options.cellAspect ?? 0.55;
-		this.bitmap = options.bitmap ?? null;
+		this.cellHeight = options.cellHeight;
+		this.scatter = options.scatter ?? 0;
+		this.bitmap = options.bitmap;
 		this.bitmapCols = options.bitmapCols ?? 0;
 		this.bitmapRows = options.bitmapRows ?? 0;
 		// the hand fills the right half of the field, anchored to the bottom
 		// right corner
 		this.regionWidthFraction = options.regionWidthFraction ?? 0.5;
 		this.regionHeightFraction = options.regionHeightFraction ?? 0.9;
-		this.regionXFraction = options.regionXFraction ?? null;
-		this.regionYFraction = options.regionYFraction ?? null;
+		this.regionXFraction = options.regionXFraction;
+		this.regionYFraction = options.regionYFraction;
 		this.flickerInterval = options.flickerIntervalMs ?? 400;
 		this.flickerDuration = options.flickerDurationMs ?? 3000;
 		this.flickerCount = options.flickerCount ?? 800;
@@ -312,11 +337,14 @@ export class GlyphField {
 		this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 		this.viewW = width;
 		this.viewH = height;
+		this.dpr = dpr;
 
 		// derive the cell size from the viewport so the field keeps its density at
 		// any resolution. a minimum cell size keeps the text readable on small
-		// screens (where the grid simply gets fewer, larger characters).
-		const cellH = Math.max(8, height / TARGET_ROWS);
+		// screens (where the grid simply gets fewer, larger characters). a fixed
+		// cellHeight (when set) overrides the derivation, so the text stays the
+		// same size no matter how tall the canvas is.
+		const cellH = this.cellHeight ?? Math.max(8, height / TARGET_ROWS);
 		const cellW = cellH * this.cellAspect;
 		this.rows = Math.max(8, Math.round(height / cellH));
 		this.cols = Math.max(16, Math.round(width / cellW));
@@ -332,6 +360,35 @@ export class GlyphField {
 		this.rebuildGrid();
 	}
 
+	// set a fixed cell height in CSS px (omit it to revert to the canvas-derived
+	// size). re-derives the grid if the field is already sized.
+	setCellHeight(h?: number) {
+		this.cellHeight = h;
+		if (this.viewW > 0) this.resize(this.viewW, this.viewH, this.dpr);
+	}
+
+	// update the lit region's fractions after construction. hosts that measure
+	// the region off a canvas whose size changes after boot (e.g. a mobile
+	// section that grows as reveals/fonts land) would otherwise keep sampling
+	// the bitmap into a stale, stretched region — which smears the shape and
+	// turns its per-cell noise into random highlights. re-derives the grid.
+	setRegion(region: { width?: number; height?: number; x?: number; y?: number }) {
+		if (region.width !== undefined) this.regionWidthFraction = region.width;
+		if (region.height !== undefined) this.regionHeightFraction = region.height;
+		if (region.x !== undefined) this.regionXFraction = region.x;
+		if (region.y !== undefined) this.regionYFraction = region.y;
+		if (this.cols > 0) this.rebuildGrid();
+	}
+
+	// tell the field how tall the visible viewport is (CSS px). the click
+	// band's ring width and travel distance are sized against this instead of
+	// the canvas height, so a canvas taller than the viewport (a mobile
+	// section backdrop) gets a screen-sized ring, not a screen-swallowing one.
+	// 0 (default) = the canvas is the viewport.
+	setViewportHeight(height: number) {
+		this.viewportH = height;
+	}
+
 	// (re)build the base phrase and the lit-region brightness for the current grid
 	private rebuildGrid() {
 		const { cols, rows } = this;
@@ -341,30 +398,38 @@ export class GlyphField {
 		this.visible = new Int16Array(cells);
 
 		// the phrase, tiled across the whole grid. each row starts at a hashed
-		// offset so the rows don't line up into a diagonal pattern
+		// offset so the rows don't line up into a diagonal pattern. a fraction of
+		// cells are swapped for random glyphs (scatter) so the repetition reads as
+		// texture instead of a clean wallpaper pattern.
 		const phrase = this.phrase;
+		const scatter = this.scatter;
 		for (let r = 0; r < rows; r++) {
 			const offset = Math.floor(hash01(r * 0x9e3779b9) * phrase.length);
 			for (let c = 0; c < cols; c++) {
+				const idx = r * cols + c;
 				const ch = phrase[(offset + c) % phrase.length];
-				this.base[r * cols + c] = this.atlas.indexOf(ch);
+				let gi = this.atlas.indexOf(ch);
+				if (scatter > 0 && hash01(idx * 0x85ebca6b) < scatter) {
+					gi = Math.floor(hash01(idx * 0xc2b2ae35) * this.atlas.length);
+				}
+				this.base[idx] = gi;
 			}
 		}
 
 		// the lit region: where it sits on the grid, and its brightness sampled from
 		// the bitmap
-		this.brightness = null;
+		this.brightness = undefined;
 		if (this.bitmap && this.bitmapCols > 0 && this.bitmapRows > 0) {
 			const regionCols = Math.max(8, Math.round(cols * this.regionWidthFraction));
 			const regionRows = Math.max(4, Math.round(rows * this.regionHeightFraction));
 			this.regionCols = regionCols;
 			this.regionRows = regionRows;
 			this.regionCol0 =
-				this.regionXFraction != null
+				this.regionXFraction !== undefined
 					? Math.min(cols - regionCols, Math.max(0, Math.round(cols * this.regionXFraction)))
 					: cols - regionCols; // anchored to the right
 			this.regionRow0 =
-				this.regionYFraction != null
+				this.regionYFraction !== undefined
 					? Math.min(rows - regionRows, Math.max(0, Math.round(rows * this.regionYFraction)))
 					: rows - regionRows; // anchored to the bottom
 			this.brightness = this.sampleBitmap(regionCols, regionRows);
