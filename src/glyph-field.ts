@@ -6,7 +6,7 @@
 // it the text is faint, inside it the text lights up. Random character slots
 // flicker to other glyphs for a few seconds, then settle back.
 
-import { bandSpread, colorForRgb, hash01, hexToRgb, noise2, voidErase } from './lookup.js';
+import { bandSpread, curveFor, hash01, hexToRgb, noise2, voidErase } from './lookup.js';
 
 // target ~77 rows of cells so the field reads as dense at a 16:9 viewport.
 // the cell size is derived from the viewport, so the density holds at any
@@ -206,9 +206,14 @@ export class GlyphField {
 	private viewW = 0;
 	private viewH = 0;
 	// the visible viewport height in CSS px (0 = the canvas is the viewport);
-	// hosts with a canvas taller than the screen report it so the click band can
-	// size its ring against the viewport instead of the whole canvas
+	// sizes the click band so a canvas taller than the screen doesn't get a
+	// screen-swallowing ring
 	private viewportH = 0;
+	// the height the click band is sized against: the viewport when known and
+	// smaller than the canvas, else the canvas itself
+	private get clickRefH(): number {
+		return this.viewportH > 0 ? Math.min(this.viewportH, this.viewH) : this.viewH;
+	}
 
 	private cellW = 0;
 	private cellH = 0;
@@ -229,6 +234,28 @@ export class GlyphField {
 
 	// the current visible glyph per cell (atlas index), rebuilt each frame
 	private visible: Int16Array = new Int16Array(0);
+
+	// last rendered state per cell, so a frame only redraws cells that changed.
+	// -1 sentinel means "nothing rendered here yet" (forces a first draw).
+	private prevGlyph: Int16Array = new Int16Array(0);
+	private prevKey: Int32Array = new Int32Array(0);
+	// forces a full redraw of every cell (set on resize / theme / phrase change /
+	// first frame)
+	private needsFullRedraw = true;
+
+	// the baked glyph atlas: every atlas glyph rendered once to an offscreen
+	// canvas, so a frame blits with drawImage instead of re-shaping text with
+	// fillText (live text layout is the main-thread cost that made the field
+	// janky). Baked at device-pixel (dpr) resolution so the per-frame blit is a
+	// 1:1 copy (no blur). The atlas is white in dark mode (glyphs are lighter
+	// than the ground) and black in light mode (glyphs are darker); the per-cell
+	// color is applied as a globalAlpha tint at blit time. Rebuilt on resize
+	// (cell size / font / dpr change) and on theme change.
+	private atlasCanvas: HTMLCanvasElement | null = null;
+	private atlasCtx: CanvasRenderingContext2D | null = null;
+
+	// per-frame scratch, reused across frames to avoid per-cell allocation
+	private col: [number, number, number] = [0, 0, 0];
 
 	private rng: () => number;
 
@@ -273,9 +300,11 @@ export class GlyphField {
 		this.clickStrength = options.clickStrength ?? 0.8;
 		this.clickDensity = options.clickDensity ?? 0.5;
 		this.clickColorExplicit = options.clickColor != null;
-		this.clickColor = hexToRgb(options.clickColor ?? (this.dark ? '#ffffff' : '#232323'));
+		// default the highlight to the ink color so it never exceeds the hand's
+		// core brightness (an explicit clickColor still wins)
+		this.clickColor = hexToRgb(options.clickColor ?? inkHex);
 		this.bg = hexToRgb(this.background);
-		this.brightness = null;
+		this.brightness = undefined;
 		this.rng = mulberry32(0x187);
 	}
 
@@ -295,19 +324,29 @@ export class GlyphField {
 	// in canvas pixels. The wave is done once it has crossed the whole canvas.
 	click(x: number, y: number) {
 		if (this.viewW <= 0 || this.viewH <= 0) return;
-		// the farthest corner from the click point
-		const corner = Math.max(
-			Math.hypot(x, y),
-			Math.hypot(this.viewW - x, y),
-			Math.hypot(x, this.viewH - y),
-			Math.hypot(this.viewW - x, this.viewH - y)
-		);
+		// the band's geometry is viewport-relative: on a canvas taller than the
+		// viewport (a mobile section backdrop) the raw canvas height would make
+		// the ring wider than the screen, lighting every visible letter at once
+		const refH = this.clickRefH;
+		// the farthest the ring has to travel to leave the visible area. when
+		// the canvas is (about) the viewport, that is the farthest canvas corner
+		// from the click point; on a taller canvas the visible box is refH tall
+		// and contains the click, so bound it by the box's diagonal.
+		const corner =
+			refH >= this.viewH
+				? Math.max(
+						Math.hypot(x, y),
+						Math.hypot(this.viewW - x, y),
+						Math.hypot(x, this.viewH - y),
+						Math.hypot(this.viewW - x, this.viewH - y)
+					)
+				: Math.hypot(Math.max(x, this.viewW - x), refH);
 		// the band is a ring ~3 sigma wide, and its edge wanders by the jitter,
-		// so it has fully left the canvas only once its inner edge (worst case)
-		// has passed the farthest corner. Grow the radius to there, not to the
-		// corner itself, or the tail of the band would sit on the corner and
+		// so it has fully left the visible area only once its inner edge (worst
+		// case) has passed the farthest corner. Grow the radius to there, not to
+		// the corner itself, or the tail of the band would sit on the corner and
 		// fade out in place instead of moving off the screen.
-		const sigma = (this.viewH * this.clickBandWidthFraction) / 2;
+		const sigma = (refH * this.clickBandWidthFraction) / 2;
 		const denom = 1 - this.clickJitter;
 		const maxR = denom > 0 ? (corner + 3 * sigma) / denom : corner + 3 * sigma;
 		this.waves.push({ x, y, start: this.lastTime, maxR, r: 0, envelope: 0 });
@@ -320,14 +359,21 @@ export class GlyphField {
 		if (this.cols > 0 && this.rows > 0) this.rebuildGrid();
 	}
 
-	// flip light/dark: re-derives the ink and background
+	// flip light/dark: re-derives the ink and background, and re-bakes the atlas
+	// (its color flips with the theme: white in dark, black in light)
 	setDark(dark: boolean, ink?: string) {
 		this.dark = dark;
 		this.background = dark ? '#181818' : '#f1eee7';
 		this.bg = hexToRgb(this.background);
 		this.ink = hexToRgb(ink ?? (dark ? '#9e9e9e' : '#232323'));
 		this.field = hexToRgb(dark ? '#1f1f1f' : '#e5e2d8');
-		if (!this.clickColorExplicit) this.clickColor = hexToRgb(dark ? '#ffffff' : '#232323');
+		// follow the ink color (set just above) so the highlight never exceeds the
+		// hand's core brightness (an explicit clickColor still wins)
+		if (!this.clickColorExplicit) this.clickColor = this.ink;
+		if (this.cols > 0 && this.rows > 0) this.bakeAtlas();
+		// the theme flip changes the color key of every cell (and the background
+		// itself), so the whole field must be repainted from scratch
+		this.needsFullRedraw = true;
 	}
 
 	resize(width: number, height: number, dpr: number) {
@@ -358,6 +404,7 @@ export class GlyphField {
 		this.fontSize = (this.cellW / w) * base;
 
 		this.rebuildGrid();
+		this.bakeAtlas();
 	}
 
 	// set a fixed cell height in CSS px (omit it to revert to the canvas-derived
@@ -389,6 +436,68 @@ export class GlyphField {
 		this.viewportH = height;
 	}
 
+	// bake the glyph atlas: render every atlas glyph once to an offscreen canvas.
+	// A frame then blits a glyph with drawImage (a cheap texture copy) instead of
+	// re-shaping it with fillText (live text layout, the main-thread cost that
+	// made the field janky). Baked at device-pixel (dpr) resolution so the blit
+	// is a 1:1 copy. The atlas is white in dark mode and black in light mode;
+	// the per-cell color is applied as a globalAlpha tint at blit time.
+	private bakeAtlas() {
+		const { atlas, cellW, cellH, fontSize, font, dpr } = this;
+		if (cellW <= 0 || cellH <= 0) return;
+		const w = Math.ceil(atlas.length * cellW * dpr);
+		const h = Math.ceil(cellH * dpr);
+		if (!this.atlasCanvas) {
+			this.atlasCanvas = document.createElement('canvas');
+			const c = this.atlasCanvas.getContext('2d');
+			if (!c) return;
+			this.atlasCtx = c;
+		}
+		const ac = this.atlasCtx!;
+		this.atlasCanvas.width = w; // also clears the canvas
+		this.atlasCanvas.height = h;
+		ac.setTransform(dpr, 0, 0, dpr, 0, 0);
+		ac.fillStyle = this.dark ? '#fff' : '#000';
+		ac.textAlign = 'center';
+		ac.textBaseline = 'middle';
+		ac.font = `${fontSize}px ${font}`;
+		for (let i = 0; i < atlas.length; i++) {
+			const ch = atlas[i];
+			if (!ch || ch === ' ') continue;
+			ac.fillText(ch, (i + 0.5) * cellW, 0.5 * cellH);
+		}
+	}
+
+	// the globalAlpha that tints the (white/black) atlas glyph to the target
+	// color over the background. In dark mode the atlas is white and the glyph
+	// sits between the ground and white: a = (col - bg) / (255 - bg). In light
+	// mode the atlas is black and the glyph sits between the ground and black:
+	// a = (bg - col) / bg. Averaged over the channels (the colors are near-
+	// grayscale, so the per-channel difference is sub-pixel).
+	private alphaFor(col: [number, number, number]): number {
+		const bg = this.bg;
+		let a: number;
+		if (this.dark) {
+			const d0 = 255 - bg[0];
+			const d1 = 255 - bg[1];
+			const d2 = 255 - bg[2];
+			a =
+				(d0 > 0 ? (col[0] - bg[0]) / d0 : 0) +
+				(d1 > 0 ? (col[1] - bg[1]) / d1 : 0) +
+				(d2 > 0 ? (col[2] - bg[2]) / d2 : 0);
+		} else {
+			const d0 = bg[0];
+			const d1 = bg[1];
+			const d2 = bg[2];
+			a =
+				(d0 > 0 ? (bg[0] - col[0]) / d0 : 1) +
+				(d1 > 0 ? (bg[1] - col[1]) / d1 : 1) +
+				(d2 > 0 ? (bg[2] - col[2]) / d2 : 1);
+		}
+		a /= 3;
+		return a < 0 ? 0 : a > 1 ? 1 : a;
+	}
+
 	// (re)build the base phrase and the lit-region brightness for the current grid
 	private rebuildGrid() {
 		const { cols, rows } = this;
@@ -396,6 +505,11 @@ export class GlyphField {
 		this.base = new Int16Array(cells);
 		this.flickerStart = new Float64Array(cells).fill(-1);
 		this.visible = new Int16Array(cells);
+		// the grid changed, so the last-rendered state is stale: re-allocate the
+		// prev-state arrays and force a full redraw of every cell
+		this.prevGlyph = new Int16Array(cells).fill(-1);
+		this.prevKey = new Int32Array(cells).fill(-1);
+		this.needsFullRedraw = true;
 
 		// the phrase, tiled across the whole grid. each row starts at a hashed
 		// offset so the rows don't line up into a diagonal pattern. a fraction of
@@ -478,9 +592,14 @@ export class GlyphField {
 			}
 		}
 
-		// start new flickers up to the target count
+		// start new flickers up to the target count. the target is capped to a
+		// fraction of the grid: flickerCount is a desktop-scale number, and on a
+		// small canvas (a phone field with few, large cells) an uncapped 800 would
+		// leave every letter constantly re-rolling. on a full desktop grid the cap
+		// never binds (800 < 5% of ~17k cells).
+		const target = Math.min(this.flickerCount, Math.round(cells * 0.05));
 		let guard = 0;
-		while (active < this.flickerCount && guard++ < this.flickerCount * 4) {
+		while (active < target && guard++ < this.flickerCount * 4) {
 			const i = Math.floor(rng() * cells);
 			if (flickerStart[i] < 0) {
 				flickerStart[i] = time;
@@ -505,14 +624,11 @@ export class GlyphField {
 
 	render(time = 0) {
 		const ctx = this.ctx;
-		const { cols, rows, cellW, cellH, fontSize } = this;
+		const { cols, rows, cellW, cellH } = this;
 		if (cols <= 0 || rows <= 0) return;
-		// paint the background, then print the single field on top
-		ctx.fillStyle = this.background;
-		ctx.fillRect(0, 0, cols * cellW, rows * cellH);
-		ctx.textAlign = 'center';
-		ctx.textBaseline = 'middle';
-		ctx.font = `${fontSize}px ${this.font}`;
+		// the atlas is baked at the exact cell size, so blits are 1:1 and need no
+		// smoothing (keeps the glyphs crisp at any dpr)
+		ctx.imageSmoothingEnabled = false;
 
 		this.updateFlicker(time);
 
@@ -525,7 +641,10 @@ export class GlyphField {
 		this.voidStrength += (target - this.voidStrength) * (1 - Math.exp(-dt / 120));
 		if (target === 0 && this.voidStrength < 0.001) this.voidStrength = 0;
 
-		const voidBase = this.viewH * this.voidRadiusFraction;
+		// cap the void radius by a fraction of the canvas width so it stays a
+		// reasonable size on narrow/portrait screens (phones) instead of
+		// swallowing the viewport; on wide desktops the height-based value wins
+		const voidBase = Math.min(this.viewH * this.voidRadiusFraction, this.viewW * 0.15);
 		const voidOn = this.voidStrength > 0.001 && voidBase > 0;
 		const voidR = voidBase * (1 + this.voidJitter); // max reach, edge wander included
 		const vMinC = voidOn ? Math.max(0, Math.floor((this.pointerX - voidR) / cellW)) : 1;
@@ -535,7 +654,8 @@ export class GlyphField {
 
 		// the click bands: rings of highlighted glyphs expanding from the click
 		// point. the band is a ring, so only the letters under it light up.
-		const waveSigma = (this.viewH * this.clickBandWidthFraction) / 2;
+		// sized against the viewport (clickRefH), not the raw canvas height.
+		const waveSigma = (this.clickRefH * this.clickBandWidthFraction) / 2;
 		const waves = this.waves;
 		// the band always takes this long to travel from the click point to fully
 		// off the screen, no matter the screen size. Each band's speed is derived
@@ -546,8 +666,15 @@ export class GlyphField {
 			const t = time - wv.start;
 			const speed = wv.maxR / duration;
 			wv.r = Math.min(wv.maxR, t * speed);
-			if (t < 250) wv.envelope = t / 250;
-			else if (t < duration) wv.envelope = 1;
+			// no ramp-in: the band lights at full strength from the first frame.
+			// (A ramp-in combined with the hard bandS threshold below delayed the
+			// first visible light until the ring had already traveled ~200px, so
+			// the wave appeared to start at the hover void's edge instead of at
+			// the click point.) The ring's own Gaussian edge already fades each
+			// cell in and out as it passes, so the wave needs no extra envelope
+			// while traveling; the tail only matters after it has crossed the
+			// canvas (which maxR guarantees it has by `duration`).
+			if (t < duration) wv.envelope = 1;
 			else if (t < duration + 1000) wv.envelope = (duration + 1000 - t) / 1000;
 			else wv.envelope = 0;
 			if (wv.envelope <= 0) waves.splice(i, 1);
@@ -555,17 +682,45 @@ export class GlyphField {
 		const waveOn = waveSigma > 0 && this.clickStrength > 0 && waves.length > 0;
 
 		const { visible, brightness, regionCol0, regionRow0, regionCols, regionRows } = this;
+		const atlas = this.atlasCanvas;
+		if (!atlas) return; // no atlas (shouldn't happen in a browser)
+		const dpr = this.dpr;
+		const col = this.col; // reused scratch, no per-cell allocation
+		const prevGlyph = this.prevGlyph;
+		const prevKey = this.prevKey;
+		// dirty-cell redraw: only cells whose glyph or color changed since the
+		// last frame are blitted. on a full redraw (first frame, resize, theme or
+		// phrase change) the canvas may be stale, so the whole background is
+		// painted once up front; afterwards only glyph->space cells are cleared.
+		const fullRedraw = this.needsFullRedraw;
+		if (fullRedraw) {
+			ctx.fillStyle = this.background;
+			ctx.fillRect(0, 0, cols * cellW, rows * cellH);
+		}
+		let lastKey = -1;
+
 		for (let r = 0; r < rows; r++) {
 			const y = (r + 0.5) * cellH;
 			for (let c = 0; c < cols; c++) {
 				const idx = r * cols + c;
 				const gi = visible[idx];
-				if (gi < 0) continue; // space in the phrase
-				let glyph = this.atlas[gi];
-				if (!glyph) continue;
+				let glyph = gi >= 0 ? this.atlas[gi] : '';
+				if (gi < 0 || !glyph) {
+					if (fullRedraw) {
+						prevGlyph[idx] = -1;
+						prevKey[idx] = -1;
+					} else if (prevGlyph[idx] >= 0) {
+						// glyph -> space: clear the cell back to the background
+						ctx.globalAlpha = 1;
+						ctx.fillStyle = this.background;
+						ctx.fillRect(c * cellW, r * cellH, cellW, cellH);
+						prevGlyph[idx] = -1;
+						prevKey[idx] = -1;
+					}
+					continue;
+				}
 
 				// the lit region is brighter; everything else is the faint end
-				let col: [number, number, number];
 				if (
 					brightness &&
 					c >= regionCol0 &&
@@ -574,10 +729,15 @@ export class GlyphField {
 					r < regionRow0 + regionRows
 				) {
 					const hb = brightness[(r - regionRow0) * regionCols + (c - regionCol0)];
-					col = colorForRgb(hb, this.field, this.ink);
+					const t = curveFor(hb / 255);
+					col[0] = this.field[0] + (this.ink[0] - this.field[0]) * t;
+					col[1] = this.field[1] + (this.ink[1] - this.field[1]) * t;
+					col[2] = this.field[2] + (this.ink[2] - this.field[2]) * t;
 				} else {
 					// outside the hand: the faint field color
-					col = this.field;
+					col[0] = this.field[0];
+					col[1] = this.field[1];
+					col[2] = this.field[2];
 				}
 
 				// the hover void erases the glyphs around the pointer, blending
@@ -590,21 +750,21 @@ export class GlyphField {
 					const n = noise2(c * 0.25, r * 0.25);
 					const e = voidErase(Math.hypot(dx, dy), voidBase, n, this.voidJitter) * this.voidStrength;
 					if (e > 0) {
-						col = [
-							col[0] + (this.bg[0] - col[0]) * e,
-							col[1] + (this.bg[1] - col[1]) * e,
-							col[2] + (this.bg[2] - col[2]) * e
-						];
+						col[0] += (this.bg[0] - col[0]) * e;
+						col[1] += (this.bg[1] - col[1]) * e;
+						col[2] += (this.bg[2] - col[2]) * e;
 					}
 				}
 
 				// the click band: a ring of highlighted glyphs. only the letters
 				// under it light up, and they flicker to other characters while
 				// lit. applied after the void so the band covers it. the noise
-				// wanders the edge so it is not a clean circle.
-				let bandS = 0;
+				// wanders the edge so it is not a clean circle. skipped entirely
+				// when no wave is in flight (the common case), so the per-cell
+				// cost is just the color + blit.
 				if (waveOn) {
 					const x = (c + 0.5) * cellW;
+					let bandS = 0;
 					for (let w = 0; w < waves.length; w++) {
 						const wv = waves[w];
 						const dx = x - wv.x;
@@ -624,31 +784,83 @@ export class GlyphField {
 							) * wv.envelope;
 						if (s > bandS) bandS = s;
 					}
-				}
-				if (bandS > 0) {
-					// gaps: only a fraction of the letters under the band light
-					// up (the rest stay as gaps), so the band reads as sparse
-					// rather than a solid wall of highlighted text
-					if (hash01(idx * 0x9e3779b9) < this.clickDensity) {
-						// the lit letters flicker to other characters. Each
-						// letter has its own phase offset, so they re-roll at
-						// different times instead of all at once
-						const phase = Math.floor(hash01(idx * 0x85ebca6b) * 60);
-						const step = Math.floor((time + phase) / 60);
-						const g = hash01((idx * 31 + step * 1000003) >>> 0);
-						glyph = this.atlas[Math.floor(g * this.atlas.length)];
-						col = [
-							col[0] + (this.clickColor[0] - col[0]) * bandS,
-							col[1] + (this.clickColor[1] - col[1]) * bandS,
-							col[2] + (this.clickColor[2] - col[2]) * bandS
-						];
+					// hard-edged ring: fully lit or not, no in-between tones (matches the
+					// reference and keeps the dirty-cell count to just the ring's edge)
+					bandS = bandS > 0.5 ? 1 : 0;
+					if (bandS > 0) {
+						// gaps: only a fraction of the letters under the band light
+						// up (the rest stay as gaps), so the band reads as sparse
+						// rather than a solid wall of highlighted text
+						if (hash01(idx * 0x9e3779b9) < this.clickDensity) {
+							// the lit letters flicker to other characters. Each
+							// letter has its own phase offset, so they re-roll at
+							// different times instead of all at once
+							const phase = Math.floor(hash01(idx * 0x85ebca6b) * 60);
+							const step = Math.floor((time + phase) / 60);
+							const g = hash01((idx * 31 + step * 1000003) >>> 0);
+							glyph = this.atlas[Math.floor(g * this.atlas.length)];
+							col[0] += (this.clickColor[0] - col[0]) * bandS;
+							col[1] += (this.clickColor[1] - col[1]) * bandS;
+							col[2] += (this.clickColor[2] - col[2]) * bandS;
+						}
 					}
 				}
 
-				ctx.fillStyle = `rgb(${Math.round(col[0])},${Math.round(col[1])},${Math.round(col[2])})`;
-				ctx.fillText(glyph, (c + 0.5) * cellW, y);
+				// the color key is the rounded rgb packed into an int, so the dirty
+				// check below can compare it against the last frame in one int
+				const cr = Math.round(col[0]);
+				const cg = Math.round(col[1]);
+				const cb = Math.round(col[2]);
+				const key = (cr << 16) | (cg << 8) | cb;
+				if (!fullRedraw && gi === prevGlyph[idx] && key === prevKey[idx]) {
+					continue; // unchanged since the last frame: nothing to redraw
+				}
+				if (fullRedraw) {
+					// run-batch the tint: the field is one color except the
+					// hand/void/click, so globalAlpha is only touched when the key
+					// changes (start each full redraw from a sentinel)
+					if (key !== lastKey) {
+						ctx.globalAlpha = this.alphaFor([cr, cg, cb]);
+						lastKey = key;
+					}
+				} else {
+					// the cell changed, so clear its rect back to the background first
+					// (at full opacity) to wipe the stale glyph, then blit the new one
+					// on top. without this the new glyph stacks on the old and the
+					// partial-alpha tint accumulates frame over frame.
+					ctx.globalAlpha = 1;
+					ctx.fillStyle = this.background;
+					ctx.fillRect(c * cellW, r * cellH, cellW, cellH);
+					// dirty cells are scattered, so set the tint per cell
+					ctx.globalAlpha = this.alphaFor([cr, cg, cb]);
+				}
+
+				// blit the glyph from the baked atlas (a cheap texture copy). the
+				// source rect is in the atlas's device pixels (baked at dpr), the
+				// dest in css px (the dpr transform scales it to match), so it is a
+				// 1:1 copy with no blur.
+				ctx.drawImage(
+					atlas,
+					gi * cellW * dpr,
+					0,
+					cellW * dpr,
+					cellH * dpr,
+					c * cellW,
+					r * cellH,
+					cellW,
+					cellH
+				);
+				// remember what we just rendered, so the next frame can skip it
+				prevGlyph[idx] = gi;
+				prevKey[idx] = key;
 			}
 		}
+
+		// the full redraw is done; from here on only dirty cells are repainted
+		if (fullRedraw) this.needsFullRedraw = false;
+		// reset the tint for other canvas users (the next frame re-sets it for its
+		// first run, so there is no cross-frame state to carry)
+		ctx.globalAlpha = 1;
 	}
 
 	destroy() {
