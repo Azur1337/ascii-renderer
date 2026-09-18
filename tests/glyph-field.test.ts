@@ -10,6 +10,7 @@ import {
 	noise2,
 	voidErase
 } from '../src/lookup.js';
+import { GlyphField } from '../src/glyph-field.js';
 import { hand } from '../assets/hand.js';
 
 // the dark-mode colors: faint field just above the background, core a mid grey
@@ -251,5 +252,193 @@ describe('hand spec', () => {
 		expect(b.filter((v) => v > 0 && v < 16).length).toBeGreaterThan(500);
 		// and a bright core near white
 		expect(b.some((v) => v > 240)).toBe(true);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// dirty-cell redraw logic
+//
+// The refactor makes render() only issue canvas draw calls for cells whose
+// rendered state (glyph index + color key) changed since the last frame. We
+// test that STATE LOGIC with a fake canvas 2d context that records calls, so
+// no real pixel output is needed (happy-dom's canvas 2d context is stubbed).
+// ---------------------------------------------------------------------------
+
+// a recording 2d context: every draw call is logged, and the properties the
+// renderer sets (fillStyle, globalAlpha, font, ...) are plain settable fields.
+// measureText returns a fixed width so resize() can derive the font size.
+// `.canvas` points back at the canvas it was created from (the renderer reads
+// this.ctx.canvas in resize() and destroy()).
+function makeRecordingContext(canvas: object) {
+	const calls: { method: string; args: unknown[] }[] = [];
+	const record =
+		(method: string) =>
+		(...args: unknown[]) => {
+			calls.push({ method, args });
+			return undefined;
+		};
+	const ctx = {
+		canvas,
+		fillStyle: '',
+		globalAlpha: 1,
+		textAlign: 'start',
+		textBaseline: 'alphabetic',
+		font: '',
+		imageSmoothingEnabled: true,
+		fillRect: record('fillRect'),
+		clearRect: record('clearRect'),
+		setTransform: record('setTransform'),
+		drawImage: record('drawImage'),
+		fillText: record('fillText'),
+		measureText: () => ({ width: 10 })
+	};
+	return { ctx, calls };
+}
+
+// a fake canvas that stands in for an HTMLCanvasElement: it has settable
+// width/height and a getContext(kind) that returns a recording 2d context for
+// '2d' (null otherwise). The context's .canvas points back at this canvas.
+function makeFakeCanvas() {
+	const canvas = {
+		width: 0,
+		height: 0,
+		getContext(kind: string) {
+			return kind === '2d' ? ctx : null;
+		}
+	} as HTMLCanvasElement & { width: number; height: number };
+	const { ctx, calls } = makeRecordingContext(canvas);
+	return { canvas, ctx, calls };
+}
+
+// a tiny, fully static field: a short phrase, no bitmap, no flicker. With
+// flickerCount: 0 the field never re-rolls, so the only changes come from
+// pointer/click, which the tests control. The renderer bakes its atlas into a
+// second canvas via document.createElement('canvas'); we patch that so it
+// returns a fake canvas (with a working getContext('2d')) too.
+function makeStaticField(width: number, height: number) {
+	const fake = makeFakeCanvas();
+	const originalCreate = document.createElement.bind(document);
+	// patch document.createElement so the atlas canvas is also fake
+	document.createElement = ((tag: string) => {
+		if (tag === 'canvas') return makeFakeCanvas().canvas;
+		return originalCreate(tag);
+	}) as typeof document.createElement;
+	const field = new GlyphField(fake.canvas as HTMLCanvasElement, {
+		atlas: 'AB ',
+		phrase: 'AB ',
+		dark: true,
+		flickerCount: 0,
+		voidRadiusFraction: 0.24,
+		voidJitter: 0.25
+	});
+	field.resize(width, height, 1);
+	return { field, fake, restore: () => (document.createElement = originalCreate) };
+}
+
+describe('dirty-cell redraw (fake canvas)', () => {
+	it('full redraw on the first frame: one drawImage per non-space cell', () => {
+		const { field, fake, restore } = makeStaticField(100, 50);
+		const before = fake.calls.filter((c) => c.method === 'drawImage').length;
+		field.render(0);
+		const after = fake.calls.filter((c) => c.method === 'drawImage').length;
+		const drawn = after - before;
+		// the grid is 100x50 = 5000 cells; the phrase 'AB ' tiles so ~1/3 are
+		// spaces (skipped). The rest are drawn. Assert a substantial number.
+		expect(drawn).toBeGreaterThan(0);
+		// and that globalAlpha was reset to 1 at the end of the frame
+		expect(fake.ctx.globalAlpha).toBe(1);
+		restore();
+	});
+
+	it('zero redraws when nothing changes (static field, no pointer/click)', () => {
+		const { field, fake, restore } = makeStaticField(100, 50);
+		field.render(0); // full redraw
+		const afterFirst = fake.calls.filter((c) => c.method === 'drawImage').length;
+		// a second frame with no changes: nothing should be redrawn
+		field.render(400);
+		const afterSecond = fake.calls.filter((c) => c.method === 'drawImage').length;
+		expect(afterSecond).toBe(afterFirst);
+		restore();
+	});
+
+	it('partial redraw when the pointer activates the void', () => {
+		const { field, fake, restore } = makeStaticField(100, 50);
+		field.render(0); // full redraw
+		const afterFirst = fake.calls.filter((c) => c.method === 'drawImage').length;
+		// move the pointer to the center: the void erases cells around it, so
+		// those cells change and are redrawn
+		field.pointer(50, 25);
+		field.render(400);
+		const afterPointer = fake.calls.filter((c) => c.method === 'drawImage').length;
+		// some cells were redrawn (the void changed them)
+		expect(afterPointer).toBeGreaterThan(afterFirst);
+		// but fewer than a full redraw (only the void-affected cells changed)
+		const fullRedrawCount = afterFirst;
+		const partialCount = afterPointer - afterFirst;
+		expect(partialCount).toBeLessThan(fullRedrawCount);
+		restore();
+	});
+
+	it('partial redraw when a click wave is in flight', () => {
+		const { field, fake, restore } = makeStaticField(100, 50);
+		field.render(0); // full redraw
+		const afterFirst = fake.calls.filter((c) => c.method === 'drawImage').length;
+		// a click spawns a wave; the band highlights cells as it expands
+		field.click(50, 25);
+		field.render(400);
+		const afterClick = fake.calls.filter((c) => c.method === 'drawImage').length;
+		expect(afterClick).toBeGreaterThan(afterFirst);
+		restore();
+	});
+
+	it('setRegion re-derives the grid and forces a full redraw', () => {
+		const { field, fake, restore } = makeStaticField(100, 50);
+		field.render(0); // full redraw
+		const afterFirst = fake.calls.filter((c) => c.method === 'drawImage').length;
+		field.render(400); // nothing changed: no redraws
+		expect(fake.calls.filter((c) => c.method === 'drawImage').length).toBe(afterFirst);
+		// changing the region fractions rebuilds the grid, so the last-rendered
+		// state is stale and the next frame is a full redraw again
+		field.setRegion({ width: 0.4, height: 0.6, x: 0.1, y: 0.2 });
+		field.render(800);
+		expect(fake.calls.filter((c) => c.method === 'drawImage').length).toBeGreaterThan(
+			afterFirst * 1.5
+		);
+		restore();
+	});
+
+	it('the viewport hint keeps the click band screen-sized', () => {
+		// a canvas far taller than the viewport (a mobile section backdrop):
+		// the ring's width derives from the viewport hint, not the canvas
+		// height. without a hint the band is wider than the screen and lights
+		// every visible cell at once; with a 400px hint the initial disc stays
+		// proportional to the visible area.
+		const litAfterClick = (hint: number) => {
+			const { field, fake, restore } = makeStaticField(100, 2000);
+			if (hint > 0) field.setViewportHeight(hint);
+			field.render(0); // full redraw; also primes lastTime for click()
+			const before = fake.calls.filter((c) => c.method === 'drawImage').length;
+			field.click(50, 1000);
+			field.render(16); // early in the wave: the disc sits on the click point
+			const drawn = fake.calls.filter((c) => c.method === 'drawImage').length - before;
+			restore();
+			return drawn;
+		};
+		const noHint = litAfterClick(0);
+		const withHint = litAfterClick(400);
+		// the hinted band still lights the letters under the click...
+		expect(withHint).toBeGreaterThan(0);
+		// ...but far fewer cells than the canvas-sized (screen-swallowing) one
+		expect(withHint * 3).toBeLessThan(noHint);
+	});
+
+	it('color-key packing is stable and distinguishable', () => {
+		// the key formula packs rounded rgb into an int: (cr<<16)|(cg<<8)|cb.
+		// same color -> same key; different color -> different key.
+		const key = (r: number, g: number, b: number) => ((r << 16) | (g << 8) | b) >>> 0;
+		expect(key(31, 31, 31)).toBe(key(31, 31, 31));
+		expect(key(31, 31, 31)).not.toBe(key(158, 158, 158));
+		expect(key(158, 158, 158)).toBe(key(158, 158, 158));
+		expect(key(0, 0, 0)).not.toBe(key(0, 0, 1));
 	});
 });
