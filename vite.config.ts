@@ -21,9 +21,6 @@ export default defineConfig({
 			formats: ['es']
 		},
 		outDir: 'dist',
-		sourcemap: true,
-		rollupOptions: {
-			external: ['three']
-		}
+		sourcemap: true
 	}
 });
