@@ -6,7 +6,7 @@ import { createAsciiRenderer } from '../src/index.js';
 const canvas = document.querySelector<HTMLCanvasElement>('#field')!;
 const renderer = createAsciiRenderer(canvas, {
 	dark: true,
-	phrase: 'WEB \u00b7 SYSTEMS \u00b7 DESIGN \u00b7 ENGINEERING \u00b7 PERFORMANCE \u00b7 ',
+	phrase: 'AZUR \u00b7 ',
 	voidRadiusFraction: 0,
 	clickBandWidthFraction: 0
 });

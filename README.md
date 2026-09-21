@@ -21,7 +21,7 @@ import { createAsciiRenderer } from 'azur-ascii-renderer';
 const canvas = document.querySelector('#field');
 const renderer = createAsciiRenderer(canvas, {
 	dark: true,
-	phrase: 'WEB \u00b7 SYSTEMS \u00b7 DESIGN \u00b7 '
+	phrase: 'AZUR \u00b7 '
 });
 
 function resize() {

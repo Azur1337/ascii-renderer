@@ -232,9 +232,7 @@ describe('hand spec', () => {
 	});
 
 	it('has a phrase whose characters are all in the atlas', () => {
-		expect(hand.phrase).toBe(
-			'WEB \u00b7 SYSTEMS \u00b7 DESIGN \u00b7 ENGINEERING \u00b7 PERFORMANCE \u00b7 '
-		);
+		expect(hand.phrase).toBe('AZUR \u00b7 ');
 		// every phrase char must be in the atlas
 		for (const ch of hand.phrase) {
 			expect(hand.atlas.indexOf(ch)).toBeGreaterThanOrEqual(0);
