@@ -1,5 +1,7 @@
 # ascii-renderer
 
+[![npm version](https://img.shields.io/npm/v/azur-ascii-renderer)](https://www.npmjs.com/package/azur-ascii-renderer)
+
 A 2D ASCII glyph-field renderer. It prints a phrase as a field of glyphs on a
 canvas, and layers on a few effects: an optional lit region, a flicker, a hover
 void, and a click band. Every effect is a toggle, so the same renderer is a full
