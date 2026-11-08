@@ -1,6 +1,6 @@
 {
 	"name": "azur-ascii-renderer",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"description": "A 2D ASCII glyph-field renderer: prints a phrase as a field of canvas glyphs, with an optional lit region, flicker, hover void, and click band.",
 	"type": "module",
 	"main": "./dist/index.js",

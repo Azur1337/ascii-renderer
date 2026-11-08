@@ -232,8 +232,20 @@ export class GlyphField {
 	private regionCols = 0;
 	private regionRows = 0;
 
-	// the current visible glyph per cell (atlas index), rebuilt each frame
+	// the hand's color per region cell, packed as a rounded rgb key and baked at
+	// rebuild/theme time. the brightness is static between those events, so the
+	// per-frame loop reads this instead of redoing the pow/lerp per cell.
+	private regionKey: Int32Array = new Int32Array(0);
+
+	// the current visible glyph per cell (atlas index), maintained incrementally
 	private visible: Int16Array = new Int16Array(0);
+
+	// active flicker state: flickerIdx[0..flickerActive) lists the flickering
+	// cells and flickerStep[i] remembers each one's last re-roll tick, so a
+	// frame touches only the active cells instead of scanning the whole grid.
+	private flickerStep: Int32Array = new Int32Array(0);
+	private flickerIdx: Int32Array = new Int32Array(0);
+	private flickerActive = 0;
 
 	// last rendered state per cell, so a frame only redraws cells that changed.
 	// -1 sentinel means "nothing rendered here yet" (forces a first draw).
@@ -256,6 +268,25 @@ export class GlyphField {
 
 	// per-frame scratch, reused across frames to avoid per-cell allocation
 	private col: [number, number, number] = [0, 0, 0];
+
+	// idle-skip bookkeeping: after the void/wave effects end, exactly one more
+	// frame must scan the grid to clear their cells; this remembers that the
+	// previous frame still had an effect running.
+	private wasAnimating = false;
+
+	// per-wave annulus boxes (cell bounds + squared radii), reused across frames
+	private waveBoxes: {
+		x: number;
+		y: number;
+		r: number;
+		outer2: number;
+		inner2: number;
+		minC: number;
+		maxC: number;
+		minR: number;
+		maxR: number;
+		envelope: number;
+	}[] = [];
 
 	private rng: () => number;
 
@@ -370,6 +401,8 @@ export class GlyphField {
 		// follow the ink color (set just above) so the highlight never exceeds the
 		// hand's core brightness (an explicit clickColor still wins)
 		if (!this.clickColorExplicit) this.clickColor = this.ink;
+		// the theme changes the hand's colors too, so re-bake the cached keys
+		this.computeRegionKeys();
 		if (this.cols > 0 && this.rows > 0) this.bakeAtlas();
 		// the theme flip changes the color key of every cell (and the background
 		// itself), so the whole field must be repainted from scratch
@@ -505,6 +538,9 @@ export class GlyphField {
 		this.base = new Int16Array(cells);
 		this.flickerStart = new Float64Array(cells).fill(-1);
 		this.visible = new Int16Array(cells);
+		this.flickerStep = new Int32Array(cells);
+		this.flickerIdx = new Int32Array(cells);
+		this.flickerActive = 0;
 		// the grid changed, so the last-rendered state is stale: re-allocate the
 		// prev-state arrays and force a full redraw of every cell
 		this.prevGlyph = new Int16Array(cells).fill(-1);
@@ -548,6 +584,27 @@ export class GlyphField {
 					: rows - regionRows; // anchored to the bottom
 			this.brightness = this.sampleBitmap(regionCols, regionRows);
 		}
+		this.computeRegionKeys();
+	}
+
+	// bake the hand's color per region cell into a packed rgb key. the
+	// brightness is static between rebuilds, so the pow/lerp work happens once
+	// here instead of in every frame's cell loop.
+	private computeRegionKeys() {
+		const { regionCols, regionRows, brightness, field, ink } = this;
+		if (!brightness) {
+			this.regionKey = new Int32Array(0);
+			return;
+		}
+		const keys = new Int32Array(regionCols * regionRows);
+		for (let i = 0; i < keys.length; i++) {
+			const t = curveFor(brightness[i] / 255);
+			const r = Math.round(field[0] + (ink[0] - field[0]) * t);
+			const g = Math.round(field[1] + (ink[1] - field[1]) * t);
+			const b = Math.round(field[2] + (ink[2] - field[2]) * t);
+			keys[i] = (r << 16) | (g << 8) | b;
+		}
+		this.regionKey = keys;
 	}
 
 	// sample the bitmap down to regionCols x regionRows. Each output cell is the
@@ -576,20 +633,41 @@ export class GlyphField {
 		return out;
 	}
 
-	// advance the flicker: start new flickers, expire old ones, re-roll active
-	private updateFlicker(time: number) {
-		const { base, flickerStart, visible, cols, rows } = this;
+	// advance the flicker incrementally: roll active cells on their step
+	// boundary, expire finished ones (restoring the base glyph), and start new
+	// ones up to the target. only the active cells are touched, not the whole
+	// grid. returns whether any visible glyph changed this call.
+	private updateFlicker(time: number): boolean {
+		const { base, flickerStart, flickerStep, flickerIdx, visible, cols, rows } = this;
 		const cells = cols * rows;
-		const rng = this.rng;
+		if (cells === 0) return false;
+		let changed = false;
 
-		// expire flickers that have run their course
-		let active = 0;
-		for (let i = 0; i < cells; i++) {
-			if (flickerStart[i] >= 0 && time - flickerStart[i] >= this.flickerDuration) {
+		// advance + compact the active list, dropping expired flickers
+		let w = 0;
+		for (let n = 0; n < this.flickerActive; n++) {
+			const i = flickerIdx[n];
+			const start = flickerStart[i];
+			if (start < 0 || time - start >= this.flickerDuration) {
 				flickerStart[i] = -1;
-			} else if (flickerStart[i] >= 0) {
-				active++;
+				if (visible[i] !== base[i]) {
+					visible[i] = base[i];
+					changed = true;
+				}
+				continue;
 			}
+			const step = Math.floor((time - start) / this.flickerInterval);
+			if (step !== flickerStep[i]) {
+				flickerStep[i] = step;
+				// hash the cell + step so each tick is a stable random glyph
+				const h = mulberry32((i * 2654435761 + step * 40503) >>> 0);
+				const gi = Math.floor(h() * this.atlas.length);
+				if (visible[i] !== gi) {
+					visible[i] = gi;
+					changed = true;
+				}
+			}
+			flickerIdx[w++] = i;
 		}
 
 		// start new flickers up to the target count. the target is capped to a
@@ -598,28 +676,24 @@ export class GlyphField {
 		// leave every letter constantly re-rolling. on a full desktop grid the cap
 		// never binds (800 < 5% of ~17k cells).
 		const target = Math.min(this.flickerCount, Math.round(cells * 0.05));
+		const rng = this.rng;
 		let guard = 0;
-		while (active < target && guard++ < this.flickerCount * 4) {
+		while (w < target && guard++ < this.flickerCount * 4) {
 			const i = Math.floor(rng() * cells);
 			if (flickerStart[i] < 0) {
 				flickerStart[i] = time;
-				active++;
+				flickerStep[i] = 0;
+				const h = mulberry32((i * 2654435761) >>> 0);
+				const gi = Math.floor(h() * this.atlas.length);
+				if (visible[i] !== gi) {
+					visible[i] = gi;
+					changed = true;
+				}
+				flickerIdx[w++] = i;
 			}
 		}
-
-		// build the visible glyph for every cell
-		for (let i = 0; i < cells; i++) {
-			const b = base[i];
-			if (flickerStart[i] >= 0) {
-				// re-roll the glyph on each interval tick
-				const step = Math.floor((time - flickerStart[i]) / this.flickerInterval);
-				// hash the cell + step so each tick is a stable random glyph
-				const h = mulberry32((i * 2654435761 + step * 40503) >>> 0);
-				visible[i] = Math.floor(h() * this.atlas.length);
-			} else {
-				visible[i] = b;
-			}
-		}
+		this.flickerActive = w;
+		return changed;
 	}
 
 	render(time = 0) {
@@ -630,7 +704,7 @@ export class GlyphField {
 		// smoothing (keeps the glyphs crisp at any dpr)
 		ctx.imageSmoothingEnabled = false;
 
-		this.updateFlicker(time);
+		const flickerChanged = this.updateFlicker(time);
 
 		// the hover void: ease its strength toward the pointer state, then work
 		// out the bounding box of cells it can reach (so the per-cell cost is
@@ -681,13 +755,82 @@ export class GlyphField {
 		}
 		const waveOn = waveSigma > 0 && this.clickStrength > 0 && waves.length > 0;
 
-		const { visible, brightness, regionCol0, regionRow0, regionCols, regionRows } = this;
+		// precompute each wave's annulus in cell coordinates (like the void's
+		// bounding box) so the per-cell wave cost is paid only near a ring. the
+		// union box gates the whole block for cells far from every ring.
+		let wMinC = cols;
+		let wMaxC = 0;
+		let wMinR = rows;
+		let wMaxR = 0;
+		if (waveOn) {
+			for (let w = 0; w < waves.length; w++) {
+				const wv = waves[w];
+				const outer = wv.r * (1 + this.clickJitter) + waveSigma * 3;
+				const inner = Math.max(0, wv.r * (1 - this.clickJitter) - waveSigma * 3);
+				let wb = this.waveBoxes[w];
+				if (!wb) {
+					wb = this.waveBoxes[w] = {
+						x: 0,
+						y: 0,
+						r: 0,
+						outer2: 0,
+						inner2: 0,
+						minC: 0,
+						maxC: 0,
+						minR: 0,
+						maxR: 0,
+						envelope: 0
+					};
+				}
+				wb.x = wv.x;
+				wb.y = wv.y;
+				wb.r = wv.r;
+				wb.outer2 = outer * outer;
+				wb.inner2 = inner * inner;
+				wb.envelope = wv.envelope;
+				wb.minC = Math.max(0, Math.floor((wv.x - outer) / cellW));
+				wb.maxC = Math.min(cols, Math.ceil((wv.x + outer) / cellW));
+				wb.minR = Math.max(0, Math.floor((wv.y - outer) / cellH));
+				wb.maxR = Math.min(rows, Math.ceil((wv.y + outer) / cellH));
+				if (wb.minC < wMinC) wMinC = wb.minC;
+				if (wb.maxC > wMaxC) wMaxC = wb.maxC;
+				if (wb.minR < wMinR) wMinR = wb.minR;
+				if (wb.maxR > wMaxR) wMaxR = wb.maxR;
+			}
+		}
+
+		const {
+			visible,
+			brightness,
+			regionCol0,
+			regionRow0,
+			regionCols,
+			regionRows,
+			regionKey
+		} = this;
 		const atlas = this.atlasCanvas;
 		if (!atlas) return; // no atlas (shouldn't happen in a browser)
 		const dpr = this.dpr;
 		const col = this.col; // reused scratch, no per-cell allocation
 		const prevGlyph = this.prevGlyph;
 		const prevKey = this.prevKey;
+		// idle frame: nothing dirty, nothing animating, and no effect winding
+		// down last frame either. skip the grid scan entirely.
+		const animating = voidOn || waveOn;
+		if (!this.needsFullRedraw && !flickerChanged && !animating && !this.wasAnimating) return;
+		this.wasAnimating = animating;
+
+		// the field and click colors are constant within a frame, so their packed
+		// keys are computed once here instead of per cell
+		const field = this.field;
+		const fieldKey =
+			(Math.round(field[0]) << 16) | (Math.round(field[1]) << 8) | Math.round(field[2]);
+		const click = this.clickColor;
+		const clickKey =
+			(Math.round(click[0]) << 16) | (Math.round(click[1]) << 8) | Math.round(click[2]);
+		const regionCol1 = regionCol0 + regionCols;
+		const regionRow1 = regionRow0 + regionRows;
+
 		// dirty-cell redraw: only cells whose glyph or color changed since the
 		// last frame are blitted. on a full redraw (first frame, resize, theme or
 		// phrase change) the canvas may be stale, so the whole background is
@@ -720,24 +863,19 @@ export class GlyphField {
 					continue;
 				}
 
-				// the lit region is brighter; everything else is the faint end
+				// the lit region is brighter; everything else is the faint end.
+				// both colors are cached keys, so there is no per-cell math here.
+				let key: number;
 				if (
 					brightness &&
 					c >= regionCol0 &&
-					c < regionCol0 + regionCols &&
+					c < regionCol1 &&
 					r >= regionRow0 &&
-					r < regionRow0 + regionRows
+					r < regionRow1
 				) {
-					const hb = brightness[(r - regionRow0) * regionCols + (c - regionCol0)];
-					const t = curveFor(hb / 255);
-					col[0] = this.field[0] + (this.ink[0] - this.field[0]) * t;
-					col[1] = this.field[1] + (this.ink[1] - this.field[1]) * t;
-					col[2] = this.field[2] + (this.ink[2] - this.field[2]) * t;
+					key = regionKey[(r - regionRow0) * regionCols + (c - regionCol0)];
 				} else {
-					// outside the hand: the faint field color
-					col[0] = this.field[0];
-					col[1] = this.field[1];
-					col[2] = this.field[2];
+					key = fieldKey;
 				}
 
 				// the hover void erases the glyphs around the pointer, blending
@@ -750,9 +888,13 @@ export class GlyphField {
 					const n = noise2(c * 0.25, r * 0.25);
 					const e = voidErase(Math.hypot(dx, dy), voidBase, n, this.voidJitter) * this.voidStrength;
 					if (e > 0) {
-						col[0] += (this.bg[0] - col[0]) * e;
-						col[1] += (this.bg[1] - col[1]) * e;
-						col[2] += (this.bg[2] - col[2]) * e;
+						const r0 = (key >> 16) & 255;
+						const g0 = (key >> 8) & 255;
+						const b0 = key & 255;
+						key =
+							(Math.round(r0 + (this.bg[0] - r0) * e) << 16) |
+							(Math.round(g0 + (this.bg[1] - g0) * e) << 8) |
+							Math.round(b0 + (this.bg[2] - b0) * e);
 					}
 				}
 
@@ -762,56 +904,45 @@ export class GlyphField {
 				// wanders the edge so it is not a clean circle. skipped entirely
 				// when no wave is in flight (the common case), so the per-cell
 				// cost is just the color + blit.
-				if (waveOn) {
+				if (waveOn && c >= wMinC && c < wMaxC && r >= wMinR && r < wMaxR) {
 					const x = (c + 0.5) * cellW;
 					let bandS = 0;
 					for (let w = 0; w < waves.length; w++) {
-						const wv = waves[w];
-						const dx = x - wv.x;
-						const dy = y - wv.y;
+						const wb = this.waveBoxes[w];
+						if (c < wb.minC || c >= wb.maxC || r < wb.minR || r >= wb.maxR) continue;
+						const dx = x - wb.x;
+						const dy = y - wb.y;
 						const d2 = dx * dx + dy * dy;
-						const outer = wv.r * (1 + this.clickJitter) + waveSigma * 3;
-						const inner = Math.max(0, wv.r * (1 - this.clickJitter) - waveSigma * 3);
-						if (d2 > outer * outer || d2 < inner * inner) continue;
+						if (d2 > wb.outer2 || d2 < wb.inner2) continue;
 						const s =
 							bandSpread(
 								Math.sqrt(d2),
-								wv.r,
+								wb.r,
 								waveSigma,
 								noise2(c * 0.25, r * 0.25),
 								this.clickJitter,
 								this.clickStrength
-							) * wv.envelope;
+							) * wb.envelope;
 						if (s > bandS) bandS = s;
 					}
 					// hard-edged ring: fully lit or not, no in-between tones (matches the
 					// reference and keeps the dirty-cell count to just the ring's edge)
-					bandS = bandS > 0.5 ? 1 : 0;
-					if (bandS > 0) {
-						// gaps: only a fraction of the letters under the band light
-						// up (the rest stay as gaps), so the band reads as sparse
-						// rather than a solid wall of highlighted text
-						if (hash01(idx * 0x9e3779b9) < this.clickDensity) {
-							// the lit letters flicker to other characters. Each
-							// letter has its own phase offset, so they re-roll at
-							// different times instead of all at once
-							const phase = Math.floor(hash01(idx * 0x85ebca6b) * 60);
-							const step = Math.floor((time + phase) / 60);
-							const g = hash01((idx * 31 + step * 1000003) >>> 0);
-							glyph = this.atlas[Math.floor(g * this.atlas.length)];
-							col[0] += (this.clickColor[0] - col[0]) * bandS;
-							col[1] += (this.clickColor[1] - col[1]) * bandS;
-							col[2] += (this.clickColor[2] - col[2]) * bandS;
-						}
+					// gaps: only a fraction of the letters under the band light up (the
+					// rest stay as gaps), so the band reads as sparse rather than a
+					// solid wall of highlighted text
+					if (bandS > 0.5 && hash01(idx * 0x9e3779b9) < this.clickDensity) {
+						// the lit letters flicker to other characters. Each letter has
+						// its own phase offset, so they re-roll at different times
+						// instead of all at once
+						const phase = Math.floor(hash01(idx * 0x85ebca6b) * 60);
+						const step = Math.floor((time + phase) / 60);
+						const g = hash01((idx * 31 + step * 1000003) >>> 0);
+						glyph = this.atlas[Math.floor(g * this.atlas.length)];
+						// bandS is 1, so the blend lands exactly on the click color
+						key = clickKey;
 					}
 				}
 
-				// the color key is the rounded rgb packed into an int, so the dirty
-				// check below can compare it against the last frame in one int
-				const cr = Math.round(col[0]);
-				const cg = Math.round(col[1]);
-				const cb = Math.round(col[2]);
-				const key = (cr << 16) | (cg << 8) | cb;
 				if (!fullRedraw && gi === prevGlyph[idx] && key === prevKey[idx]) {
 					continue; // unchanged since the last frame: nothing to redraw
 				}
@@ -820,7 +951,10 @@ export class GlyphField {
 					// hand/void/click, so globalAlpha is only touched when the key
 					// changes (start each full redraw from a sentinel)
 					if (key !== lastKey) {
-						ctx.globalAlpha = this.alphaFor([cr, cg, cb]);
+						col[0] = (key >> 16) & 255;
+						col[1] = (key >> 8) & 255;
+						col[2] = key & 255;
+						ctx.globalAlpha = this.alphaFor(col);
 						lastKey = key;
 					}
 				} else {
@@ -832,7 +966,10 @@ export class GlyphField {
 					ctx.fillStyle = this.background;
 					ctx.fillRect(c * cellW, r * cellH, cellW, cellH);
 					// dirty cells are scattered, so set the tint per cell
-					ctx.globalAlpha = this.alphaFor([cr, cg, cb]);
+					col[0] = (key >> 16) & 255;
+					col[1] = (key >> 8) & 255;
+					col[2] = key & 255;
+					ctx.globalAlpha = this.alphaFor(col);
 				}
 
 				// blit the glyph from the baked atlas (a cheap texture copy). the
